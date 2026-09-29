@@ -40,6 +40,11 @@ constexpr int kDisplayWidth = 240;
 constexpr int kDisplayHeight = 240;
 
 constexpr uint32_t kDisplaySpiWriteHz = 40000000;
+/** Off-screen frame buffer depth. 16 = RGB565 (115 KB), 8 = RGB332 (57.6 KB).
+ *  The C3 has no PSRAM: at 16 bit only ~55 KB heap is left, which is right at
+ *  what one TLS handshake needs, so fetches start failing with "SSL - Memory
+ *  allocation failed" as the heap drifts. 8 bit leaves a safe margin. */
+constexpr int kFrameColorDepth = 8;
 // GC9A01 modules often need invert + BGR for correct black/green output
 constexpr bool kDisplayInvert = true;
 constexpr bool kDisplayRgbOrder = true;
@@ -50,6 +55,27 @@ constexpr double kDefaultRadarLon = 4.9041;
 
 /** Poll adsb.fi (API public limit: 1 req/s). */
 constexpr unsigned long kAdsbFetchIntervalMs = 3000;
+/** Show the "NO DATA" badge once the last good fetch is older than this. */
+constexpr unsigned long kAdsbStaleMs = 30000;
+
+// --- Long-run self-healing ---
+/** Consecutive failed fetches before WiFi is dropped and reconnected (catches
+ *  the "WL_CONNECTED but nothing gets through" state). */
+constexpr uint8_t kFetchFailsWifiReset = 10;
+/** Consecutive failed fetches before the board reboots (last resort). */
+constexpr uint8_t kFetchFailsReboot = 30;
+/** Skip route lookups while the largest free block is below this: mbedTLS
+ *  needs ~17 KB contiguous for its RX record buffer, and the ADS-B fetch has
+ *  priority over the extra route GETs. */
+constexpr uint32_t kRouteMinMaxAllocHeap = 28000;
+/** Reboot when the largest free block stays below this — TLS can no longer
+ *  allocate, so every fetch would fail until a restart anyway. */
+constexpr uint32_t kRebootMinMaxAllocHeap = 18000;
+/** Loop-task watchdog: reboot if loop() (or a network poll hook) is not
+ *  serviced for this long. Must exceed the longest blocking step (TLS connect
+ *  5 s + handshake 10 s, WiFi reconnect attempt 15 s). */
+constexpr uint32_t kLoopWatchdogSec = 60;
+
 /** Legacy scale unused — fetch uses radar::fetchRadiusKm() to screen edge. */
 constexpr float kAdsbFetchRadiusScale = 1.0f;
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */

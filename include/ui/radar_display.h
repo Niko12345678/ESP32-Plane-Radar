@@ -15,4 +15,8 @@ void radarDisplayRefreshAircraft();
  */
 void radarDisplayAnimTick();
 
+/** Show / hide the "NO DATA" badge (aircraft data is out of date). Takes
+ *  effect on the next draw. */
+void radarDisplaySetStale(bool stale);
+
 }  // namespace ui

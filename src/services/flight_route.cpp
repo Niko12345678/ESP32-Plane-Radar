@@ -1,8 +1,6 @@
 #include "services/flight_route.h"
 
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-
+#include <Arduino.h>
 #include <ArduinoJson.h>
 
 #include <cctype>
@@ -12,13 +10,11 @@
 #include "config.h"
 #include "data/airports.h"
 #include "data/city_exonyms.h"
+#include "services/https_json.h"
 
 namespace services::route {
 
 namespace {
-
-constexpr int kConnectAttemptMs = 200;
-constexpr unsigned long kRequestTimeoutMs = 8000;
 
 struct CacheEntry {
   char callsign[9] = {0};
@@ -39,12 +35,6 @@ struct CacheEntry {
 };
 
 CacheEntry s_cache[config::kRouteCacheSize];
-
-void pollHook(PollFn poll) {
-  if (poll != nullptr) {
-    poll();
-  }
-}
 
 // --- callsign classification -------------------------------------------------
 
@@ -377,60 +367,25 @@ void fillFromCache(const CacheEntry& e, float ac_lat, float ac_lon,
   }
 }
 
-// --- HTTP ----------------------------------------------------------------
+// --- JSON filters ----------------------------------------------------------
 
-// Returns the HTTP status code (0 on transport failure). The body is read for
-// 200 and for 404 — both hexdb ("Route not found.") and adsbdb ("unknown
-// callsign") answer a miss with 404 plus a valid JSON body, a firm "no route".
-int httpGetBody(const String& url, String& payload, PollFn poll) {
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    return 0;
+// Keep only the one field each lookup reads. Both hexdb ("Route not found.")
+// and adsbdb ("unknown callsign") answer a miss with 404 plus a JSON body — a
+// firm "no route", which parses to an empty document here.
+JsonVariantConst routeFilter() {
+  static JsonDocument filter;
+  if (filter.isNull()) {
+    filter["route"] = true;
   }
-  // hexdb and adsbdb both sit behind a CDN that chunks HTTP/1.1 responses with
-  // no Content-Length; force HTTP/1.0 so the body arrives unframed (same reason
-  // as adsb_client).
-  http.useHTTP10(true);
-  http.setConnectTimeout(kConnectAttemptMs);
-  http.setTimeout(kRequestTimeoutMs);
+  return filter.as<JsonVariantConst>();
+}
 
-  pollHook(poll);
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK && code != HTTP_CODE_NOT_FOUND) {
-    http.end();
-    return code > 0 ? code : 0;
+JsonVariantConst airlineFilter() {
+  static JsonDocument filter;
+  if (filter.isNull()) {
+    filter["response"]["flightroute"]["airline"]["name"] = true;
   }
-
-  WiFiClient* stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    http.end();
-    return 0;
-  }
-
-  uint8_t buf[512];
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollHook(poll);
-    const int avail = stream->available();
-    if (avail > 0) {
-      const int want =
-          avail > static_cast<int>(sizeof(buf)) ? static_cast<int>(sizeof(buf))
-                                                : avail;
-      const int got = stream->readBytes(buf, want);
-      if (got > 0) {
-        payload.concat(reinterpret_cast<const char*>(buf),
-                       static_cast<unsigned>(got));
-      }
-    } else if (!http.connected()) {
-      break;
-    }
-    delay(1);
-  }
-  http.end();
-  return payload.length() > 0 ? code : 0;
+  return filter.as<JsonVariantConst>();
 }
 
 // --- hexdb route parsing -------------------------------------------------
@@ -526,8 +481,11 @@ Result resolve(const char* callsign, char* origin, size_t origin_len, char* dest
   String url = config::kRouteApiBase;
   url += callsign;
 
-  String payload;
-  const int code = httpGetBody(url, payload, poll);
+  JsonDocument doc;
+  int code = 0;
+  // parsed = got a well-formed response (route or "not found")
+  const bool parsed = net::getJson(url.c_str(), routeFilter(), doc, poll,
+                                   /*accept_not_found=*/true, &code);
 
   char new_origin[sizeof(CacheEntry::origin)] = {0};
   char new_dest[sizeof(CacheEntry::dest)] = {0};
@@ -535,35 +493,28 @@ Result resolve(const char* callsign, char* origin, size_t origin_len, char* dest
   char new_dest_code[sizeof(CacheEntry::dest_code)] = {0};
   char new_airline[sizeof(CacheEntry::airline)] = {0};
   float o_lat = NAN, o_lon = NAN, d_lat = NAN, d_lon = NAN;
-  bool parsed = false;  // got a well-formed response (route or "not found")
 
-  if (code != 0) {
-    JsonDocument doc;
-    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
-      parsed = true;
-      const char* route = doc["route"].as<const char*>();
-      char oi[5], di[5];
-      if (route != nullptr && splitRoute(route, oi, di)) {
-        const data::airports::Airport* oa = airportByIcao(oi);
-        const data::airports::Airport* da = airportByIcao(di);
-        labelForAirport(oa, oi, new_origin, sizeof(new_origin));
-        labelForAirport(da, di[0] ? di : nullptr, new_dest, sizeof(new_dest));
-        codeForAirport(oa, oi, new_origin_code, sizeof(new_origin_code));
-        codeForAirport(da, di[0] ? di : nullptr, new_dest_code,
-                       sizeof(new_dest_code));
-        if (di[0] == '\0') {
-          new_dest[0] = '\0';
-          new_dest_code[0] = '\0';
-        }
-        if (oa != nullptr) {
-          o_lat = oa->lat_e7 / 1e7f;
-          o_lon = oa->lon_e7 / 1e7f;
-        }
-        if (da != nullptr) {
-          d_lat = da->lat_e7 / 1e7f;
-          d_lon = da->lon_e7 / 1e7f;
-        }
-      }
+  const char* route = parsed ? doc["route"].as<const char*>() : nullptr;
+  char oi[5], di[5];
+  if (route != nullptr && splitRoute(route, oi, di)) {
+    const data::airports::Airport* oa = airportByIcao(oi);
+    const data::airports::Airport* da = airportByIcao(di);
+    labelForAirport(oa, oi, new_origin, sizeof(new_origin));
+    labelForAirport(da, di[0] ? di : nullptr, new_dest, sizeof(new_dest));
+    codeForAirport(oa, oi, new_origin_code, sizeof(new_origin_code));
+    codeForAirport(da, di[0] ? di : nullptr, new_dest_code,
+                   sizeof(new_dest_code));
+    if (di[0] == '\0') {
+      new_dest[0] = '\0';
+      new_dest_code[0] = '\0';
+    }
+    if (oa != nullptr) {
+      o_lat = oa->lat_e7 / 1e7f;
+      o_lon = oa->lon_e7 / 1e7f;
+    }
+    if (da != nullptr) {
+      d_lat = da->lat_e7 / 1e7f;
+      d_lon = da->lon_e7 / 1e7f;
     }
   }
 
@@ -573,15 +524,14 @@ Result resolve(const char* callsign, char* origin, size_t origin_len, char* dest
   if (has_route && config::kAirlineApiBase[0] != '\0') {
     String aurl = config::kAirlineApiBase;
     aurl += callsign;
-    String apayload;
-    if (httpGetBody(aurl, apayload, poll) != 0) {
-      JsonDocument adoc;
-      if (deserializeJson(adoc, apayload) == DeserializationError::Ok) {
-        const char* al_name =
-            adoc["response"]["flightroute"]["airline"]["name"].as<const char*>();
-        if (al_name != nullptr && al_name[0] != '\0') {
-          foldAscii(al_name, new_airline, sizeof(new_airline), /*lower=*/false);
-        }
+    int acode = 0;
+    // Reuses `doc` (getJson clears it) so only one document is ever alive.
+    if (net::getJson(aurl.c_str(), airlineFilter(), doc, poll,
+                     /*accept_not_found=*/true, &acode)) {
+      const char* al_name =
+          doc["response"]["flightroute"]["airline"]["name"].as<const char*>();
+      if (al_name != nullptr && al_name[0] != '\0') {
+        foldAscii(al_name, new_airline, sizeof(new_airline), /*lower=*/false);
       }
     }
   }

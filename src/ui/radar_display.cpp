@@ -887,11 +887,34 @@ void drawStaticGrid(Gfx& gfx) {
   gfx.setTextDatum(textdatum_t::top_left);
 }
 
+bool s_stale = false;
+
+// Drawn on top of everything so a stuck feed is obvious instead of looking
+// like a frozen screen.
+void drawStaleBadge() {
+  if (!s_stale) {
+    return;
+  }
+  applyScaleStyle();
+  s_draw->setTextDatum(textdatum_t::middle_center);
+  constexpr char kText[] = "NO DATA";
+  const int tw = s_draw->textWidth(kText);
+  const int th = s_draw->fontHeight();
+  constexpr int kPadX = 5;
+  constexpr int kPadY = 3;
+  const int x = radar::kCenterX;
+  const int y = radar::kCenterY + radar::kGridOuterRadius / 2;
+  s_draw->fillRoundRect(x - tw / 2 - kPadX, y - th / 2 - kPadY, tw + kPadX * 2,
+                        th + kPadY * 2, 4, radar::kColorVertDescent);
+  s_draw->setTextColor(radar::kColorBackground, radar::kColorVertDescent);
+  s_draw->drawString(kText, x, y);
+}
+
 bool ensureFrameSprite() {
   if (s_frame_ready) {
     return true;
   }
-  s_frame.setColorDepth(16);
+  s_frame.setColorDepth(config::kFrameColorDepth);
   if (!s_frame.createSprite(radar::kSize, radar::kSize)) {
     Serial.println("radar: frame sprite alloc failed");
     return false;
@@ -908,6 +931,7 @@ void renderFrame() {
   {
     const DrawScope scope(s_frame);
     drawAircraft();
+    drawStaleBadge();
   }
   s_frame.pushSprite(0, 0);
   tft.setTextDatum(textdatum_t::top_left);
@@ -928,8 +952,11 @@ void radarDisplayDraw() {
   const DrawScope scope(tft);
   drawStaticGrid(tft);
   drawAircraft();
+  drawStaleBadge();
   tft.setTextDatum(textdatum_t::top_left);
 }
+
+void radarDisplaySetStale(bool stale) { s_stale = stale; }
 
 void radarDisplayRefreshAircraft() {
   initPalette();

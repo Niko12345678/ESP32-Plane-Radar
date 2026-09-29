@@ -7,6 +7,7 @@
 
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp_wifi.h>
 
 #ifdef WM_MDNS
@@ -347,6 +348,7 @@ bool waitForLinkWithUi(const char* ssid_for_ui, unsigned long attempt_ms) {
     if (wifiLinkUp()) {
       return true;
     }
+    esp_task_wdt_reset();  // no-op until setup() has armed the watchdog
     bootButtonPollLongPress();
     statusScreenConnectingTick();
     delay(config::kWifiConnectingFrameMs);

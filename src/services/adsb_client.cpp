@@ -1,14 +1,13 @@
 #include "services/adsb_client.h"
 
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-
+#include <Arduino.h>
 #include <ArduinoJson.h>
 
 #include <cstring>
 
 #include "config.h"
 #include "services/flight_route.h"
+#include "services/https_json.h"
 #include "services/track_history.h"
 #include "ui/radar_range.h"
 
@@ -18,74 +17,26 @@ namespace {
 
 constexpr char kApiBase[] = "https://opendata.adsb.fi/api/v3/lat/";
 constexpr float kKmPerNm = 1.852f;
-constexpr int kConnectAttemptMs = 200;
-constexpr unsigned long kRequestTimeoutMs = 10000;
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
 PollFn s_poll_fn = nullptr;
 
-void pollNetwork() {
-  if (s_poll_fn != nullptr) {
-    s_poll_fn();
-  }
-}
-
-int performGetWithPoll(HTTPClient& http) {
-  http.setConnectTimeout(kConnectAttemptMs);
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int code = http.GET();
-    if (code > 0) {
-      return code;
+// Only the fields read below survive parsing; the rest of each adsb.fi record
+// (mlat, nac_p, rssi, squawk, ...) is dropped on the fly, cutting the document
+// several-fold.
+JsonVariantConst aircraftFilter() {
+  static JsonDocument filter;
+  if (filter.isNull()) {
+    JsonObject plane = filter["ac"].add<JsonObject>();
+    for (const char* key :
+         {"hex", "flight", "t", "lat", "lon", "alt_baro", "alt_geom",
+          "true_heading", "mag_heading", "track", "dir", "gs", "tas", "ias",
+          "baro_rate", "geom_rate"}) {
+      plane[key] = true;
     }
-    if (code != HTTPC_ERROR_CONNECTION_REFUSED &&
-        code != HTTPC_ERROR_NOT_CONNECTED) {
-      return code;
-    }
-    delay(5);
   }
-  return HTTPC_ERROR_READ_TIMEOUT;
-}
-
-bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
-  WiFiClient* stream = http.getStreamPtr();
-  if (stream == nullptr) {
-    return false;
-  }
-
-  const int content_length = http.getSize();
-  if (content_length > 0) {
-    payload.reserve(static_cast<unsigned>(content_length + 1));
-  }
-
-  uint8_t buffer[512];
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
-    pollNetwork();
-    const int available = stream->available();
-    if (available > 0) {
-      const int to_read =
-          available > static_cast<int>(sizeof(buffer)) ? static_cast<int>(sizeof(buffer))
-                                                       : available;
-      const int read_bytes = stream->readBytes(buffer, to_read);
-      if (read_bytes > 0) {
-        payload.concat(reinterpret_cast<const char*>(buffer),
-                       static_cast<unsigned>(read_bytes));
-      }
-    }
-    if (content_length > 0 &&
-        static_cast<int>(payload.length()) >= content_length) {
-      break;
-    }
-    if (!http.connected() && stream->available() <= 0) {
-      break;
-    }
-    delay(1);
-  }
-
-  return payload.length() > 0;
+  return filter.as<JsonVariantConst>();
 }
 
 float kmToNauticalMiles(float km) { return km / kKmPerNm; }
@@ -254,43 +205,11 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   url += "/dist/";
   url += String(dist_nm, 1);
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    Serial.println("adsb: http.begin failed");
-    return false;
-  }
-
-  // adsb.fi sits behind Cloudflare, which replies with Transfer-Encoding:
-  // chunked and no Content-Length on HTTP/1.1. readResponseBodyWithPoll() reads
-  // the raw socket via getStreamPtr() and does not de-chunk, so the chunk-size
-  // hex lines end up in the payload and deserializeJson() fails with
-  // InvalidInput. Forcing HTTP/1.0 makes the server send the body unframed,
-  // delimited by connection close (already handled by the read loop).
-  http.useHTTP10(true);
-
-  http.setTimeout(kRequestTimeoutMs);
-  const int code = performGetWithPoll(http);
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("adsb: HTTP %d\n", code);
-    http.end();
-    return false;
-  }
-
-  String payload;
-  if (!readResponseBodyWithPoll(http, payload)) {
-    Serial.println("adsb: empty response");
-    http.end();
-    return false;
-  }
-  http.end();
-
   JsonDocument doc;
-  const DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.printf("adsb: JSON parse error: %s\n", err.c_str());
+  int code = 0;
+  if (!net::getJson(url.c_str(), aircraftFilter(), doc, s_poll_fn,
+                    /*accept_not_found=*/false, &code)) {
+    Serial.printf("adsb: fetch failed (http %d)\n", code);
     return false;
   }
 
@@ -329,7 +248,9 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   }
   track::expireStale();
 
-  Serial.printf("adsb: %u aircraft\n", static_cast<unsigned>(n));
+  Serial.printf("adsb: %u aircraft (heap %u, max block %u)\n",
+                static_cast<unsigned>(n), ESP.getFreeHeap(),
+                ESP.getMaxAllocHeap());
   return true;
 }
 
